@@ -9,9 +9,7 @@ import { Film, FolderOpen, Save, Settings } from 'lucide-react';
 
 const DEFAULT_TRACKS: Track[] = [
   { id: 'v1', name: 'Video Track 1', type: 'video', clips: [] },
-  { id: 'v2', name: 'Video Track 2', type: 'video', clips: [] },
   { id: 'a1', name: 'Audio Track 1', type: 'audio', clips: [] },
-  { id: 'a2', name: 'Audio Track 2', type: 'audio', clips: [] },
 ];
 
 function App() {
@@ -23,13 +21,14 @@ function App() {
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'assets' | 'properties'>('assets');
   const [isExportOpen, setIsExportOpen] = useState<boolean>(false);
+  const [activeTool, setActiveTool] = useState<'select' | 'blade'>('select');
 
   // Hidden video/audio elements pool mapping clipId -> mediaElement
   const mediaElementsRef = useRef<Map<string, HTMLMediaElement>>(new Map());
   const [mediaElementsMap, setMediaElementsMap] = useState<Map<string, HTMLMediaElement>>(new Map());
 
-  // Master project duration (highest clip timeEnd, min 10 seconds)
-  const duration = Math.max(10, ...tracks.flatMap((t) => t.clips.map((c) => c.timeEnd)));
+  // Master project duration (highest clip timeEnd, min 5 minutes / 300 seconds)
+  const duration = Math.max(300, ...tracks.flatMap((t) => t.clips.map((c) => c.timeEnd)));
 
   // 1. Playback Timer Loop
   const lastTickRef = useRef<number | null>(null);
@@ -96,11 +95,6 @@ function App() {
             el.volume = clip.volume;
             el.playbackRate = clip.speed;
             
-            // Loop capability if clip duration is larger than source (e.g. images or repeating audio)
-            if (asset.type === 'audio' || asset.type === 'video') {
-              // Standard behavior is boundary clipping, not looping.
-            }
-
             mediaElementsRef.current.set(clip.id, el);
             changed = true;
           }
@@ -122,25 +116,23 @@ function App() {
 
         const isActive = playhead >= clip.timeStart && playhead <= clip.timeEnd;
         if (isActive) {
-          // Calculate source playhead coordinate
           const targetSourceTime = clip.trimStart + (playhead - clip.timeStart) * clip.speed;
 
           if (el.playbackRate !== clip.speed) el.playbackRate = clip.speed;
           if (el.volume !== clip.volume) el.volume = clip.volume;
 
-          // Sync Play/Pause
           if (isPlaying && el.paused) {
             el.play().catch(() => {});
           } else if (!isPlaying && !el.paused) {
             el.pause();
           }
 
-          // Frame Seek Sync (only seek if deviation is > 0.12s to avoid audio popping and stutter)
-          if (Math.abs(el.currentTime - targetSourceTime) > 0.12) {
+          // Dynamic threshold to prevent audio popping/stuttering during active playback
+          const threshold = isPlaying ? 0.45 : 0.05;
+          if (Math.abs(el.currentTime - targetSourceTime) > threshold) {
             el.currentTime = targetSourceTime;
           }
         } else {
-          // Pause if clip is out of playhead range
           if (!el.paused) {
             el.pause();
           }
@@ -160,6 +152,12 @@ function App() {
       } else if (e.code === 'KeyS') {
         e.preventDefault();
         handleSplit();
+      } else if (e.code === 'KeyV') {
+        e.preventDefault();
+        setActiveTool('select');
+      } else if (e.code === 'KeyB') {
+        e.preventDefault();
+        setActiveTool('blade');
       } else if (e.code === 'Delete' || e.code === 'Backspace') {
         if (selectedClipId) {
           e.preventDefault();
@@ -206,7 +204,7 @@ function App() {
           name: file.name,
           type: 'image',
           url,
-          duration: 5.0, // Default duration for image clips is 5s
+          duration: 5.0,
           width: img.width,
           height: img.height,
           file,
@@ -218,7 +216,6 @@ function App() {
 
   const handleRemoveAsset = (id: string) => {
     setAssets((prev) => prev.filter((a) => a.id !== id));
-    // Remove any clips referencing this asset
     setTracks((prev) =>
       prev.map((track) => ({
         ...track,
@@ -232,7 +229,6 @@ function App() {
   };
 
   const handleAddToTimeline = (asset: Asset) => {
-    // Find compatible track
     const targetType = asset.type === 'audio' ? 'audio' : 'video';
     const compatibleTrack = tracks.find((t) => t.type === targetType);
     if (compatibleTrack) {
@@ -240,11 +236,72 @@ function App() {
     }
   };
 
-  // Add new clip to a specific track
+  // Add new clip with Linked A/V support
   const handleAddNewClipToTrack = (assetId: string, trackId: string, timeStart: number) => {
     const asset = assets.find((a) => a.id === assetId);
     if (!asset) return;
 
+    const isVideoAsset = asset.type === 'video';
+    const currentTrack = tracks.find((t) => t.id === trackId);
+
+    if (isVideoAsset && currentTrack && currentTrack.type === 'video') {
+      // Find or create an audio track to place linked audio clip
+      let audioTrack = tracks.find((t) => t.type === 'audio');
+      if (!audioTrack) {
+        // Fallback create track if missing
+        handleAddTrack('audio');
+        return; // handleAddTrack will trigger state change, drop again or add
+      }
+
+      const videoClipId = 'clip_' + Math.random().toString(36).substr(2, 9);
+      const audioClipId = 'clip_' + Math.random().toString(36).substr(2, 9);
+
+      const newVideoClip: Clip = {
+        id: videoClipId,
+        assetId,
+        trackId,
+        timeStart,
+        timeEnd: timeStart + asset.duration,
+        trimStart: 0,
+        trimEnd: 0,
+        volume: 1.0,
+        speed: 1.0,
+        name: asset.name,
+        linkedClipId: audioClipId,
+      };
+
+      const newAudioClip: Clip = {
+        id: audioClipId,
+        assetId,
+        trackId: audioTrack.id,
+        timeStart,
+        timeEnd: timeStart + asset.duration,
+        trimStart: 0,
+        trimEnd: 0,
+        volume: 1.0,
+        speed: 1.0,
+        name: `${asset.name} (Audio)`,
+        linkedClipId: videoClipId,
+      };
+
+      setTracks((prev) =>
+        prev.map((track) => {
+          if (track.id === trackId) {
+            return { ...track, clips: [...track.clips, newVideoClip] };
+          }
+          if (audioTrack && track.id === audioTrack.id) {
+            return { ...track, clips: [...track.clips, newAudioClip] };
+          }
+          return track;
+        })
+      );
+
+      setSelectedClipId(videoClipId);
+      setActiveTab('properties');
+      return;
+    }
+
+    // Standard clip addition
     const newClip: Clip = {
       id: 'clip_' + Math.random().toString(36).substr(2, 9),
       assetId,
@@ -270,15 +327,69 @@ function App() {
     setActiveTab('properties');
   };
 
-  // Update clip properties (drag, trim, properties panel)
+  // Add Empty track programmatically
+  const handleAddTrack = (type: 'video' | 'audio') => {
+    const typeCount = tracks.filter((t) => t.type === type).length + 1;
+    const newTrack: Track = {
+      id: `${type}_track_${Math.random().toString(36).substr(2, 9)}`,
+      name: `${type === 'video' ? 'Video' : 'Audio'} Track ${typeCount}`,
+      type,
+      clips: [],
+    };
+    setTracks((prev) => [...prev, newTrack]);
+  };
+
+  // Dynamic track creation & clip placement (drag to top/bottom of tracks columns)
+  const handleAddTrackAndClip = (
+    type: 'video' | 'audio',
+    assetId: string,
+    timeStart: number,
+    insertAt: 'top' | 'bottom'
+  ) => {
+    const typeCount = tracks.filter((t) => t.type === type).length + 1;
+    const newTrackId = `${type}_track_${Math.random().toString(36).substr(2, 9)}`;
+    const newTrackName = `${type === 'video' ? 'Video' : 'Audio'} Track ${typeCount}`;
+
+    const newTrack: Track = {
+      id: newTrackId,
+      name: newTrackName,
+      type,
+      clips: [],
+    };
+
+    const videos = tracks.filter((t) => t.type === 'video');
+    const audios = tracks.filter((t) => t.type === 'audio');
+
+    let updatedTracks: Track[] = [];
+    if (type === 'video') {
+      if (insertAt === 'top') {
+        updatedTracks = [newTrack, ...videos, ...audios];
+      } else {
+        updatedTracks = [...videos, newTrack, ...audios];
+      }
+    } else {
+      if (insertAt === 'top') {
+        updatedTracks = [...videos, newTrack, ...audios];
+      } else {
+        updatedTracks = [...videos, ...audios, newTrack];
+      }
+    }
+
+    setTracks(updatedTracks);
+
+    // Place clip on new track
+    setTimeout(() => {
+      handleAddNewClipToTrack(assetId, newTrackId, timeStart);
+    }, 80);
+  };
+
+  // Update clip properties (drag, trim, settings)
   const handleUpdateClip = (clipId: string, updates: Partial<Clip>) => {
     setTracks((prev) =>
       prev.map((track) => {
-        // Remove from old track if trackId has changed (track drag and drop)
         if (updates.trackId && updates.trackId !== track.id && track.clips.some((c) => c.id === clipId)) {
           return { ...track, clips: track.clips.filter((c) => c.id !== clipId) };
         }
-        // Add to new track if it matches updates.trackId
         if (updates.trackId && updates.trackId === track.id && !track.clips.some((c) => c.id === clipId)) {
           const oldClip = findClipAcrossTracks(clipId);
           if (oldClip) {
@@ -286,7 +397,6 @@ function App() {
             return { ...track, clips: [...track.clips, updated] };
           }
         }
-        // Otherwise, update inside original track
         return {
           ...track,
           clips: track.clips.map((clip) => {
@@ -309,61 +419,170 @@ function App() {
   };
 
   const handleDeleteClip = (clipId: string) => {
+    const clip = findClipAcrossTracks(clipId);
+    const linkedId = clip?.linkedClipId;
+
     setTracks((prev) =>
       prev.map((track) => ({
         ...track,
-        clips: track.clips.filter((c) => c.id !== clipId),
+        clips: track.clips.filter((c) => c.id !== clipId && c.id !== linkedId),
       }))
     );
-    if (selectedClipId === clipId) {
+    if (selectedClipId === clipId || selectedClipId === linkedId) {
       setSelectedClipId(null);
       setActiveTab('assets');
     }
   };
 
+  // Split clips with Linked A/V support
   const handleSplit = () => {
     if (!selectedClipId) return;
     const clip = findClipAcrossTracks(selectedClipId);
     if (!clip) return;
 
-    // Check if playhead is strictly inside the clip boundaries
     if (playhead > clip.timeStart && playhead < clip.timeEnd) {
-      const cutPointDuration = playhead - clip.timeStart;
-      const cutPointSource = clip.trimStart + cutPointDuration * clip.speed;
+      const cutDuration = playhead - clip.timeStart;
+      
+      const clip1Id = clip.id;
+      const clip2Id = 'clip_' + Math.random().toString(36).substr(2, 9);
+      const cutPointSource = clip.trimStart + cutDuration * clip.speed;
 
-      const clip1Updates: Partial<Clip> = {
-        timeEnd: playhead,
-      };
+      let linkedClip1Id: string | undefined = undefined;
+      let linkedClip2Id: string | undefined = undefined;
+      const linkedClip = clip.linkedClipId ? findClipAcrossTracks(clip.linkedClipId) : null;
 
-      const clip2: Clip = {
-        id: 'clip_' + Math.random().toString(36).substr(2, 9),
-        assetId: clip.assetId,
-        trackId: clip.trackId,
-        timeStart: playhead,
-        timeEnd: clip.timeEnd,
-        trimStart: cutPointSource,
-        trimEnd: clip.trimEnd,
-        volume: clip.volume,
-        speed: clip.speed,
-        name: `${clip.name} (Part 2)`,
-      };
+      if (linkedClip && playhead > linkedClip.timeStart && playhead < linkedClip.timeEnd) {
+        linkedClip1Id = linkedClip.id;
+        linkedClip2Id = 'clip_' + Math.random().toString(36).substr(2, 9);
+      }
 
       setTracks((prev) =>
         prev.map((track) => {
+          let trackClips = [...track.clips];
+
           if (track.id === clip.trackId) {
-            const updatedClips = track.clips.map((c) => {
+            trackClips = trackClips.map((c) => {
               if (c.id === clip.id) {
-                return { ...c, ...clip1Updates, name: `${c.name} (Part 1)` };
+                return {
+                  ...c,
+                  timeEnd: playhead,
+                  name: `${c.name} (Part 1)`,
+                  linkedClipId: linkedClip1Id ? linkedClip1Id : c.linkedClipId,
+                };
               }
               return c;
             });
-            return { ...track, clips: [...updatedClips, clip2] };
+
+            const clip2: Clip = {
+              id: clip2Id,
+              assetId: clip.assetId,
+              trackId: clip.trackId,
+              timeStart: playhead,
+              timeEnd: clip.timeEnd,
+              trimStart: cutPointSource,
+              trimEnd: clip.trimEnd,
+              volume: clip.volume,
+              speed: clip.speed,
+              name: `${clip.name} (Part 2)`,
+              linkedClipId: linkedClip2Id,
+            };
+            trackClips.push(clip2);
           }
-          return track;
+
+          if (linkedClip && track.id === linkedClip.trackId) {
+            const linkedCutSource = linkedClip.trimStart + cutDuration * linkedClip.speed;
+            trackClips = trackClips.map((c) => {
+              if (c.id === linkedClip!.id) {
+                return {
+                  ...c,
+                  timeEnd: playhead,
+                  name: `${c.name} (Part 1)`,
+                  linkedClipId: clip1Id,
+                };
+              }
+              return c;
+            });
+
+            const linkedClip2: Clip = {
+              id: linkedClip2Id!,
+              assetId: linkedClip.assetId,
+              trackId: linkedClip.trackId,
+              timeStart: playhead,
+              timeEnd: linkedClip.timeEnd,
+              trimStart: linkedCutSource,
+              trimEnd: linkedClip.trimEnd,
+              volume: linkedClip.volume,
+              speed: linkedClip.speed,
+              name: `${linkedClip.name} (Part 2)`,
+              linkedClipId: clip2Id,
+            };
+            trackClips.push(linkedClip2);
+          }
+
+          return { ...track, clips: trackClips };
         })
       );
-      setSelectedClipId(clip2.id);
+      setSelectedClipId(clip2Id);
     }
+  };
+
+  // Join adjacent/contiguous clips together (Heal Split)
+  const handleJoinClips = (clipId1: string, clipId2: string) => {
+    const clip1 = findClipAcrossTracks(clipId1);
+    const clip2 = findClipAcrossTracks(clipId2);
+    if (!clip1 || !clip2) return;
+
+    const earlier = clip1.timeStart < clip2.timeStart ? clip1 : clip2;
+    const later = clip1.timeStart < clip2.timeStart ? clip2 : clip1;
+
+    let linkedEarlier: Clip | null = null;
+    let linkedLater: Clip | null = null;
+    if (earlier.linkedClipId && later.linkedClipId) {
+      linkedEarlier = findClipAcrossTracks(earlier.linkedClipId);
+      linkedLater = findClipAcrossTracks(later.linkedClipId);
+    }
+
+    setTracks((prev) =>
+      prev.map((track) => {
+        let trackClips = [...track.clips];
+
+        if (track.id === earlier.trackId) {
+          trackClips = trackClips.map((c) => {
+            if (c.id === earlier.id) {
+              const cleanName = c.name.replace(' (Part 1)', '').replace(' (Part 2)', '');
+              return {
+                ...c,
+                timeEnd: later.timeEnd,
+                name: cleanName,
+                linkedClipId: linkedEarlier ? linkedEarlier.id : undefined,
+              };
+            }
+            return c;
+          });
+          trackClips = trackClips.filter((c) => c.id !== later.id);
+        }
+
+        if (linkedEarlier && linkedLater && track.id === linkedEarlier.trackId) {
+          trackClips = trackClips.map((c) => {
+            if (c.id === linkedEarlier!.id) {
+              const cleanName = c.name.replace(' (Part 1)', '').replace(' (Part 2)', '');
+              return {
+                ...c,
+                timeEnd: linkedLater!.timeEnd,
+                name: cleanName,
+                linkedClipId: earlier.id,
+              };
+            }
+            return c;
+          });
+          trackClips = trackClips.filter((c) => c.id !== linkedLater!.id);
+        }
+
+        return { ...track, clips: trackClips };
+      })
+    );
+
+    setSelectedClipId(earlier.id);
   };
 
   return (
@@ -447,6 +666,8 @@ function App() {
         zoom={zoom}
         duration={duration}
         selectedClipId={selectedClipId}
+        activeTool={activeTool}
+        onChangeTool={setActiveTool}
         onSeek={setPlayhead}
         onUpdateZoom={setZoom}
         onUpdateClip={handleUpdateClip}
@@ -454,8 +675,12 @@ function App() {
         onDeleteClip={handleDeleteClip}
         onSplit={handleSplit}
         onAddClipToTrack={handleAddNewClipToTrack}
+        onAddTrackAndClip={handleAddTrackAndClip}
+        onAddTrack={handleAddTrack}
+        onJoinClips={handleJoinClips}
       />
 
+      {/* Export Modal */}
       <ExportModal
         isOpen={isExportOpen}
         onClose={() => setIsExportOpen(false)}

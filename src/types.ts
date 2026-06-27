@@ -20,6 +20,7 @@ export interface Clip {
   volume: number; // 0.0 to 1.0
   speed: number; // Playback speed multiplier (e.g., 1.0)
   name: string;
+  linkedClipId?: string; // Links video and audio clips together
 }
 
 export interface Track {
