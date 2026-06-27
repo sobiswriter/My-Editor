@@ -21,6 +21,21 @@ export interface Clip {
   speed: number; // Playback speed multiplier (e.g., 1.0)
   name: string;
   linkedClipId?: string; // Links video and audio clips together
+
+  // Transform Controls (relative to a 1280x720 canvas)
+  x?: number;
+  y?: number;
+  scale?: number;
+  rotation?: number;
+  flipH?: boolean;
+  flipV?: boolean;
+  fitMode?: 'fit' | 'fill' | 'stretch' | 'custom';
+
+  // Text Overlay properties
+  text?: string;
+  textColor?: string;
+  fontSize?: number;
+  fontFamily?: string;
 }
 
 export interface Track {
@@ -39,4 +54,5 @@ export interface EditorState {
   selectedClipId: string | null;
   selectedTrackId: string | null;
   duration: number; // Total length of the project timeline (seconds)
+  aspectRatio: '16:9' | '9:16' | '1:1' | '4:3' | '4:5' | '21:9' | '2:3';
 }

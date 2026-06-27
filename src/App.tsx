@@ -6,6 +6,7 @@ import { Timeline } from './components/Timeline';
 import { ClipControls } from './components/ClipControls';
 import { ExportModal } from './components/ExportModal';
 import { Film, FolderOpen, Save, Settings } from 'lucide-react';
+import { formatTime } from './utils/time';
 
 const DEFAULT_TRACKS: Track[] = [
   { id: 'v1', name: 'Video Track 1', type: 'video', clips: [] },
@@ -22,19 +23,32 @@ function App() {
   const [activeTab, setActiveTab] = useState<'assets' | 'properties'>('assets');
   const [isExportOpen, setIsExportOpen] = useState<boolean>(false);
   const [activeTool, setActiveTool] = useState<'select' | 'blade'>('select');
+  const [aspectRatio, setAspectRatio] = useState<'16:9' | '9:16' | '1:1' | '4:3' | '4:5' | '21:9' | '2:3'>('16:9');
+  const [masterVolume, setMasterVolume] = useState<number>(1.0);
+  const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [masterSpeed, setMasterSpeed] = useState<number>(1.0);
 
   // Hidden video/audio elements pool mapping clipId -> mediaElement
   const mediaElementsRef = useRef<Map<string, HTMLMediaElement>>(new Map());
   const [mediaElementsMap, setMediaElementsMap] = useState<Map<string, HTMLMediaElement>>(new Map());
 
+  const playheadRef = useRef<number>(0);
+  const lastStateUpdateRef = useRef<number>(0);
+
+  // Sync playhead state to ref
+  useEffect(() => {
+    playheadRef.current = playhead;
+  }, [playhead]);
+
   // Master project duration (highest clip timeEnd, min 5 minutes / 300 seconds)
   const duration = Math.max(300, ...tracks.flatMap((t) => t.clips.map((c) => c.timeEnd)));
 
-  // 1. Playback Timer Loop
+  // 1. Playback Timer Loop (Throttled React updates for buttery smooth 60fps canvas performance)
   const lastTickRef = useRef<number | null>(null);
   useEffect(() => {
     if (!isPlaying) {
       lastTickRef.current = null;
+      (window as any).masterPlayhead = undefined;
       return;
     }
 
@@ -43,24 +57,44 @@ function App() {
       if (lastTickRef.current === null) {
         lastTickRef.current = now;
       }
-      const delta = (now - lastTickRef.current) / 1000;
+      const delta = ((now - lastTickRef.current) / 1000) * masterSpeed;
       lastTickRef.current = now;
 
-      setPlayhead((prev) => {
-        const next = prev + delta;
-        if (next >= duration) {
-          setIsPlaying(false);
-          return duration;
-        }
-        return next;
-      });
+      // Update playhead ref
+      playheadRef.current = Math.min(duration, playheadRef.current + delta);
+      const currentPlayhead = playheadRef.current;
+      
+      // Update global playhead for Canvas Player
+      (window as any).masterPlayhead = currentPlayhead;
 
-      animId = requestAnimationFrame(tick);
+      // Direct DOM updates at 60fps to bypass React diff overhead
+      const playheadLine = document.querySelector('.playhead-line') as HTMLDivElement;
+      if (playheadLine) {
+        playheadLine.style.left = `${currentPlayhead * zoom}px`;
+      }
+      const timeCurrent = document.querySelector('.player-time-current') as HTMLSpanElement;
+      if (timeCurrent) {
+        timeCurrent.textContent = formatTime(currentPlayhead);
+      }
+
+      // Throttle React state updates to 10fps (every 100ms)
+      if (now - lastStateUpdateRef.current > 100) {
+        setPlayhead(currentPlayhead);
+        lastStateUpdateRef.current = now;
+      }
+
+      if (currentPlayhead >= duration) {
+        setIsPlaying(false);
+        setPlayhead(duration);
+        (window as any).masterPlayhead = undefined;
+      } else {
+        animId = requestAnimationFrame(tick);
+      }
     };
 
     animId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(animId);
-  }, [isPlaying, duration]);
+  }, [isPlaying, duration, zoom, masterSpeed]);
 
   // 2. Synchronize Media Elements Pool (when tracks or assets change)
   useEffect(() => {
@@ -81,10 +115,13 @@ function App() {
       }
     });
 
-    // Create new clips elements
+    // Create new clips elements (only for visual/audio files, not text clips)
     let changed = false;
     tracks.forEach((track) => {
       track.clips.forEach((clip) => {
+        // Skip elements creation for text layers
+        if (clip.text !== undefined) return;
+
         if (!mediaElementsRef.current.has(clip.id)) {
           const asset = assets.find((a) => a.id === clip.assetId);
           if (asset) {
@@ -94,6 +131,9 @@ function App() {
             el.crossOrigin = 'anonymous';
             el.volume = clip.volume;
             el.playbackRate = clip.speed;
+            if (track.type === 'video') {
+              (el as HTMLVideoElement).playsInline = true;
+            }
             
             mediaElementsRef.current.set(clip.id, el);
             changed = true;
@@ -118,17 +158,25 @@ function App() {
         if (isActive) {
           const targetSourceTime = clip.trimStart + (playhead - clip.timeStart) * clip.speed;
 
-          if (el.playbackRate !== clip.speed) el.playbackRate = clip.speed;
-          if (el.volume !== clip.volume) el.volume = clip.volume;
+          // Multiply master speed by individual clip speed
+          const targetSpeed = masterSpeed * clip.speed;
+          if (el.playbackRate !== targetSpeed) el.playbackRate = targetSpeed;
+          
+          // Multiply master volume by individual clip volume
+          const targetVolume = isMuted ? 0 : masterVolume * clip.volume;
+          if (el.volume !== targetVolume) el.volume = targetVolume;
 
           if (isPlaying && el.paused) {
+            // Seed exact source time when first entering active state
+            el.currentTime = targetSourceTime;
             el.play().catch(() => {});
           } else if (!isPlaying && !el.paused) {
             el.pause();
           }
 
-          // Dynamic threshold to prevent audio popping/stuttering during active playback
-          const threshold = isPlaying ? 0.45 : 0.05;
+          // Use a massive threshold during active play to let browser play natively without stutter-seeks,
+          // but seek immediately during manual scrub pauses.
+          const threshold = isPlaying ? 1.5 : 0.05;
           if (Math.abs(el.currentTime - targetSourceTime) > threshold) {
             el.currentTime = targetSourceTime;
           }
@@ -139,12 +187,12 @@ function App() {
         }
       });
     });
-  }, [playhead, isPlaying, tracks, mediaElementsMap]);
+  }, [playhead, isPlaying, tracks, mediaElementsMap, masterVolume, isMuted, masterSpeed]);
 
   // Keyboard Shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) return;
 
       if (e.code === 'Space') {
         e.preventDefault();
@@ -158,6 +206,9 @@ function App() {
       } else if (e.code === 'KeyB') {
         e.preventDefault();
         setActiveTool('blade');
+      } else if (e.code === 'KeyT') {
+        e.preventDefault();
+        handleAddTextClip();
       } else if (e.code === 'Delete' || e.code === 'Backspace') {
         if (selectedClipId) {
           e.preventDefault();
@@ -165,16 +216,37 @@ function App() {
         }
       } else if (e.code === 'ArrowLeft') {
         e.preventDefault();
-        setPlayhead((prev) => Math.max(0, prev - 1 / 30));
+        handleStepPlayhead(-1 / 30);
       } else if (e.code === 'ArrowRight') {
         e.preventDefault();
-        setPlayhead((prev) => Math.min(duration, prev + 1 / 30));
+        handleStepPlayhead(1 / 30);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isPlaying, selectedClipId, duration, tracks]);
+
+  const handleSeek = (time: number) => {
+    setPlayhead(time);
+    playheadRef.current = time;
+    (window as any).masterPlayhead = time;
+
+    // Direct DOM updates for instant feedback during scrubs/seeks
+    const playheadLine = document.querySelector('.playhead-line') as HTMLDivElement;
+    if (playheadLine) {
+      playheadLine.style.left = `${time * zoom}px`;
+    }
+    const timeCurrent = document.querySelector('.player-time-current') as HTMLSpanElement;
+    if (timeCurrent) {
+      timeCurrent.textContent = formatTime(time);
+    }
+  };
+
+  const handleStepPlayhead = (delta: number) => {
+    const newPlayhead = Math.max(0, Math.min(duration, playheadRef.current + delta));
+    handleSeek(newPlayhead);
+  };
 
   // Asset Import Handlers
   const handleAddAsset = (file: File) => {
@@ -245,12 +317,10 @@ function App() {
     const currentTrack = tracks.find((t) => t.id === trackId);
 
     if (isVideoAsset && currentTrack && currentTrack.type === 'video') {
-      // Find or create an audio track to place linked audio clip
       let audioTrack = tracks.find((t) => t.type === 'audio');
       if (!audioTrack) {
-        // Fallback create track if missing
         handleAddTrack('audio');
-        return; // handleAddTrack will trigger state change, drop again or add
+        return;
       }
 
       const videoClipId = 'clip_' + Math.random().toString(36).substr(2, 9);
@@ -268,6 +338,11 @@ function App() {
         speed: 1.0,
         name: asset.name,
         linkedClipId: audioClipId,
+        x: 0,
+        y: 0,
+        scale: 1.0,
+        rotation: 0,
+        fitMode: 'fit',
       };
 
       const newAudioClip: Clip = {
@@ -313,6 +388,11 @@ function App() {
       volume: 1.0,
       speed: 1.0,
       name: asset.name,
+      x: 0,
+      y: 0,
+      scale: 1.0,
+      rotation: 0,
+      fitMode: 'fit',
     };
 
     setTracks((prev) =>
@@ -325,6 +405,75 @@ function App() {
     );
     setSelectedClipId(newClip.id);
     setActiveTab('properties');
+  };
+
+  // Add editable Text clip to timeline (Starts with default 5.0 seconds duration)
+  const handleAddTextClip = () => {
+    const videoTrack = tracks.find((t) => t.type === 'video');
+    if (!videoTrack) return;
+
+    const textClipId = 'clip_text_' + Math.random().toString(36).substr(2, 9);
+    const newTextClip: Clip = {
+      id: textClipId,
+      assetId: '', // no assets needed for pure text clip overlays
+      trackId: videoTrack.id,
+      timeStart: playhead,
+      timeEnd: playhead + 5.0, // default 5.0s timeline duration
+      trimStart: 0,
+      trimEnd: 0,
+      volume: 0,
+      speed: 1.0,
+      name: 'Text Overlay',
+      text: 'Double click to edit text',
+      textColor: '#ffffff',
+      fontSize: 48,
+      fontFamily: 'Outfit',
+      x: 0,
+      y: 0,
+      scale: 1.0,
+      rotation: 0,
+    };
+
+    setTracks((prev) =>
+      prev.map((track) => {
+        if (track.id === videoTrack.id) {
+          return { ...track, clips: [...track.clips, newTextClip] };
+        }
+        return track;
+      })
+    );
+
+    setSelectedClipId(textClipId);
+    setActiveTab('properties');
+  };
+
+  // Detach Audio from linked video clip (mutes video layer automatically)
+  const handleDetachAudio = (clipId: string) => {
+    const clip = findClipAcrossTracks(clipId);
+    if (!clip || !clip.linkedClipId) return;
+
+    const linkedClip = findClipAcrossTracks(clip.linkedClipId);
+    if (!linkedClip) return;
+
+    // Identify which clip is visual (video/text) vs audio
+    const isClipVisual = clip.text !== undefined || tracks.find(t => t.id === clip.trackId)?.type === 'video';
+    const videoClip = isClipVisual ? clip : linkedClip;
+    const audioClip = isClipVisual ? linkedClip : clip;
+
+    setTracks((prev) =>
+      prev.map((track) => ({
+        ...track,
+        clips: track.clips.map((c) => {
+          if (c.id === videoClip.id) {
+            return { ...c, linkedClipId: undefined, volume: 0 }; // mute video clip to prevent double audio!
+          }
+          if (c.id === audioClip.id) {
+            return { ...c, linkedClipId: undefined, name: c.name.replace(' (Audio)', ' (Detached)') };
+          }
+          return c;
+        }),
+      }))
+    );
   };
 
   // Add Empty track programmatically
@@ -651,10 +800,19 @@ function App() {
           duration={duration}
           tracks={tracks}
           selectedClipId={selectedClipId}
+          aspectRatio={aspectRatio}
+          onChangeAspectRatio={setAspectRatio}
           onTogglePlay={() => setIsPlaying(!isPlaying)}
-          onSeek={setPlayhead}
+          onSeek={handleSeek}
           onSplit={handleSplit}
           mediaElements={mediaElementsMap}
+          onUpdateClip={handleUpdateClip}
+          masterVolume={masterVolume}
+          onChangeMasterVolume={setMasterVolume}
+          isMuted={isMuted}
+          onChangeMuted={setIsMuted}
+          masterSpeed={masterSpeed}
+          onChangeMasterSpeed={setMasterSpeed}
         />
       </div>
 
@@ -662,13 +820,13 @@ function App() {
       <Timeline
         tracks={tracks}
         assets={assets}
-        playhead={playhead}
+        playheadRef={playheadRef}
         zoom={zoom}
         duration={duration}
         selectedClipId={selectedClipId}
         activeTool={activeTool}
         onChangeTool={setActiveTool}
-        onSeek={setPlayhead}
+        onSeek={handleSeek}
         onUpdateZoom={setZoom}
         onUpdateClip={handleUpdateClip}
         onSelectClip={setSelectedClipId}
@@ -678,6 +836,8 @@ function App() {
         onAddTrackAndClip={handleAddTrackAndClip}
         onAddTrack={handleAddTrack}
         onJoinClips={handleJoinClips}
+        onAddTextClip={handleAddTextClip}
+        onDetachAudio={handleDetachAudio}
       />
 
       {/* Export Modal */}
@@ -686,9 +846,13 @@ function App() {
         onClose={() => setIsExportOpen(false)}
         duration={duration}
         mediaElements={mediaElementsMap}
-        onSeek={setPlayhead}
         onTogglePlay={() => setIsPlaying(!isPlaying)}
         isPlaying={isPlaying}
+        tracks={tracks}
+        assets={assets}
+        aspectRatio={aspectRatio}
+        masterVolume={masterVolume}
+        isMuted={isMuted}
       />
     </div>
   );

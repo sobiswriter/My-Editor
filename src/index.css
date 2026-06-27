@@ -139,9 +139,12 @@ body {
 .side-panel {
   display: grid;
   grid-template-rows: 48px 1fr;
-  border-right: 1px solid var(--border-light);
+  border: 1px solid var(--border-medium);
+  border-radius: 12px;
   overflow: hidden;
-  height: 100%;
+  height: calc(100% - 24px);
+  margin: 12px 6px 12px 12px;
+  background: var(--bg-panel);
 }
 
 .panel-tabs {
@@ -283,7 +286,10 @@ body {
   justify-content: center;
   padding: 20px;
   background: rgba(0, 0, 0, 0.2);
-  height: 100%;
+  height: calc(100% - 24px);
+  margin: 12px 12px 12px 6px;
+  border: 1px solid var(--border-medium);
+  border-radius: 12px;
   overflow: hidden;
   position: relative;
 }
@@ -344,11 +350,13 @@ body {
 /* Timeline Panel */
 .timeline-panel {
   background: var(--bg-timeline);
-  border-top: 1px solid var(--border-light);
+  border: 1px solid var(--border-medium);
+  border-radius: 12px;
+  margin: 0 12px 12px 12px;
+  overflow: hidden;
+  height: calc(100% - 12px);
   display: grid;
   grid-template-rows: 40px 36px 1fr;
-  overflow: hidden;
-  height: 100%;
 }
 
 /* Timeline Toolbar */

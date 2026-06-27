@@ -6,7 +6,7 @@ import { ZoomIn, ZoomOut, Magnet, Trash2, Split, Eye, Volume2, MousePointer, Sci
 interface TimelineProps {
   tracks: Track[];
   assets: Asset[];
-  playhead: number;
+  playheadRef: React.RefObject<number>;
   zoom: number; // Pixels per second
   duration: number; // Project duration in seconds
   selectedClipId: string | null;
@@ -22,12 +22,14 @@ interface TimelineProps {
   onAddTrackAndClip: (type: 'video' | 'audio', assetId: string, timeStart: number, insertAt: 'top' | 'bottom') => void;
   onAddTrack: (type: 'video' | 'audio') => void;
   onJoinClips: (clipId1: string, clipId2: string) => void;
+  onAddTextClip: () => void;
+  onDetachAudio: (clipId: string) => void;
 }
 
 export const Timeline: React.FC<TimelineProps> = ({
   tracks,
   assets,
-  playhead,
+  playheadRef,
   zoom,
   duration,
   selectedClipId,
@@ -43,6 +45,8 @@ export const Timeline: React.FC<TimelineProps> = ({
   onAddTrackAndClip,
   onAddTrack,
   onJoinClips,
+  onAddTextClip,
+  onDetachAudio,
 }) => {
   const tracksViewportRef = useRef<HTMLDivElement>(null);
   const rulerCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -182,18 +186,42 @@ export const Timeline: React.FC<TimelineProps> = ({
     if (!viewport) return;
     
     if (prevZoomRef.current !== zoom) {
-      const playheadPx = playhead * zoom;
+      const playheadPx = playheadRef.current * zoom;
       const newScrollLeft = playheadPx - viewport.clientWidth / 2;
       viewport.scrollLeft = Math.max(0, newScrollLeft);
       setScrollLeft(viewport.scrollLeft);
       prevZoomRef.current = zoom;
     }
-  }, [zoom, playhead]);
+  }, [zoom]);
+
+  // Keep playhead in view during active playback (page-by-page jump scroll, throttled to 250ms interval)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const viewport = tracksViewportRef.current;
+      if (viewport) {
+        const playheadPx = playheadRef.current * zoom;
+        const scrollRightEdge = viewport.scrollLeft + viewport.clientWidth;
+        
+        // If playhead goes past right edge of screen, shift screen left
+        if (playheadPx > scrollRightEdge - 15) {
+          viewport.scrollLeft = playheadPx - 50;
+          setScrollLeft(viewport.scrollLeft);
+        }
+        // If playhead goes behind left edge, shift screen right
+        else if (playheadPx < viewport.scrollLeft) {
+          viewport.scrollLeft = Math.max(0, playheadPx - 50);
+          setScrollLeft(viewport.scrollLeft);
+        }
+      }
+    }, 250);
+
+    return () => clearInterval(interval);
+  }, [zoom]);
 
   // Snapping calculations
   const getSnapPoints = (excludeClipId: string): number[] => {
     if (!isSnapping) return [];
-    const points: number[] = [0, playhead];
+    const points: number[] = [0, playheadRef.current];
     tracks.forEach((t) => {
       t.clips.forEach((c) => {
         if (c.id !== excludeClipId && c.id !== findClip(excludeClipId)?.linkedClipId) {
@@ -496,7 +524,7 @@ export const Timeline: React.FC<TimelineProps> = ({
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [activeDrag, zoom, tracks, playhead, isSnapping, activeTool]);
+  }, [activeDrag, zoom, tracks, isSnapping, activeTool]);
 
   // Asset Drag and Drop directly onto tracks
   const handleTrackDragOver = (e: React.DragEvent, trackId: string) => {
@@ -601,6 +629,29 @@ export const Timeline: React.FC<TimelineProps> = ({
             <Split size={14} />
             Split
           </button>
+
+          {/* Add Text Button */}
+          <button
+            className="btn"
+            style={{ padding: '6px 12px', fontSize: '0.8rem' }}
+            onClick={onAddTextClip}
+            title="Add Text Clip at playhead (T)"
+          >
+            <Plus size={14} />
+            Add Text
+          </button>
+
+          {/* Detach Audio Button */}
+          {selectedClipId && findClip(selectedClipId)?.linkedClipId && (
+            <button
+              className="btn btn-primary"
+              style={{ padding: '6px 12px', fontSize: '0.8rem', background: 'var(--color-warning)', color: '#000' }}
+              onClick={() => onDetachAudio(selectedClipId)}
+              title="Detach Audio Layer from Video"
+            >
+              Detach Audio
+            </button>
+          )}
 
           {mergeableInfo && (
             <button
@@ -717,7 +768,7 @@ export const Timeline: React.FC<TimelineProps> = ({
             {/* Playhead line pointer */}
             <div
               className="playhead-line"
-              style={{ left: `${playhead * zoom}px` }}
+              style={{ left: `${playheadRef.current * zoom}px` }}
             >
               <div className="playhead-handle" />
             </div>
@@ -752,6 +803,8 @@ export const Timeline: React.FC<TimelineProps> = ({
                   const width = (clip.timeEnd - clip.timeStart) * zoom;
                   const isSelected = clip.id === selectedClipId;
 
+                  const isTextClip = clip.text !== undefined;
+
                   return (
                     <div
                       key={clip.id}
@@ -759,6 +812,8 @@ export const Timeline: React.FC<TimelineProps> = ({
                       style={{
                         left: `${left}px`,
                         width: `${width}px`,
+                        background: isTextClip ? 'linear-gradient(135deg, rgba(236, 72, 153, 0.25) 0%, rgba(244, 63, 94, 0.15) 100%)' : undefined,
+                        borderColor: isTextClip ? 'rgba(236, 72, 153, 0.4)' : undefined,
                       }}
                       onMouseDown={(e) => handleClipMouseDown(e, clip, 'move')}
                     >
@@ -767,14 +822,20 @@ export const Timeline: React.FC<TimelineProps> = ({
                         {clip.name}
                       </div>
 
-                      {/* Video clip thumbnails mockup (Patrick Star layout) */}
-                      <div style={{ display: 'flex', gap: '2px', height: '24px', opacity: 0.35, pointerEvents: 'none', overflow: 'hidden' }}>
-                        {Array.from({ length: Math.ceil(width / 32) }).map((_, idx) => (
-                          <div key={idx} style={{ width: '30px', height: '24px', background: 'rgba(0,0,0,0.4)', borderRadius: '2px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                            <span style={{ fontSize: '0.5rem', transform: 'scale(0.8)' }}>🎞️</span>
-                          </div>
-                        ))}
-                      </div>
+                      {/* Video clip thumbnails mockup (Patrick Star layout) or Text Preview */}
+                      {isTextClip ? (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', height: '24px', opacity: 0.6, fontSize: '0.7rem', color: '#f472b6', fontStyle: 'italic', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+                          <span>📝 "{clip.text}"</span>
+                        </div>
+                      ) : (
+                        <div style={{ display: 'flex', gap: '2px', height: '24px', opacity: 0.35, pointerEvents: 'none', overflow: 'hidden' }}>
+                          {Array.from({ length: Math.ceil(width / 32) }).map((_, idx) => (
+                            <div key={idx} style={{ width: '30px', height: '24px', background: 'rgba(0,0,0,0.4)', borderRadius: '2px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                              <span style={{ fontSize: '0.5rem', transform: 'scale(0.8)' }}>🎞️</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
 
                       <div className="clip-duration-label">
                         {((clip.timeEnd - clip.timeStart)).toFixed(2)}s

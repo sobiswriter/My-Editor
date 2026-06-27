@@ -1,37 +1,55 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Download, Film, CheckCircle, RefreshCw, X, AlertTriangle } from 'lucide-react';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import { toBlobURL } from '@ffmpeg/util';
+import type { Track, Asset } from '../types';
 
 interface ExportModalProps {
   isOpen: boolean;
   onClose: () => void;
   duration: number;
   mediaElements: Map<string, HTMLMediaElement>;
-  onSeek: (time: number) => void;
   onTogglePlay: () => void;
   isPlaying: boolean;
+  tracks: Track[];
+  assets: Asset[];
+  aspectRatio: '16:9' | '9:16' | '1:1' | '4:3' | '4:5' | '21:9' | '2:3';
+  masterVolume: number;
+  isMuted: boolean;
 }
+
+const ASPECT_RATIO_PRESETS = [
+  { value: '16:9', width: 1280, height: 720 },
+  { value: '9:16', width: 720, height: 1280 },
+  { value: '1:1', width: 1080, height: 1080 },
+  { value: '4:3', width: 960, height: 720 },
+  { value: '4:5', width: 864, height: 1080 },
+  { value: '21:9', width: 1680, height: 720 },
+  { value: '2:3', width: 720, height: 1080 },
+];
 
 export const ExportModal: React.FC<ExportModalProps> = ({
   isOpen,
   onClose,
   duration,
   mediaElements,
-  onSeek,
   onTogglePlay,
   isPlaying,
+  tracks,
+  assets,
+  aspectRatio,
+  masterVolume,
+  isMuted,
 }) => {
   const [exportFormat, setExportFormat] = useState<string>('webm');
   const [exportResolution, setExportResolution] = useState<string>('720p');
-  const [exportState, setExportState] = useState<'idle' | 'recording' | 'transcoding' | 'done' | 'error'>('idle');
+  const [exportState, setExportState] = useState<'idle' | 'rendering' | 'transcoding' | 'done' | 'error'>('idle');
   const [progress, setProgress] = useState<number>(0);
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [outputUrl, setOutputUrl] = useState<string | null>(null);
 
   const ffmpegRef = useRef<FFmpeg | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
+  const isCanceledRef = useRef<boolean>(false);
 
   useEffect(() => {
     if (!isOpen) {
@@ -39,10 +57,13 @@ export const ExportModal: React.FC<ExportModalProps> = ({
       setExportState('idle');
       setProgress(0);
       setStatusMessage('');
+      isCanceledRef.current = true;
       if (outputUrl) {
         URL.revokeObjectURL(outputUrl);
         setOutputUrl(null);
       }
+    } else {
+      isCanceledRef.current = false;
     }
   }, [isOpen]);
 
@@ -51,8 +72,6 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
     setStatusMessage('Loading Transcoder engine...');
     const ffmpeg = new FFmpeg();
-    
-    // Core files loaded from CDN for lightweight setup
     const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
     await ffmpeg.load({
       coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
@@ -63,103 +82,372 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     return ffmpeg;
   };
 
+  // WAV Audio Encoder Helper (16-bit PCM WAV)
+  const bufferToWav = (buffer: AudioBuffer): Blob => {
+    const numOfChan = buffer.numberOfChannels;
+    const length = buffer.length * numOfChan * 2 + 44;
+    const bufferArr = new ArrayBuffer(length);
+    const view = new DataView(bufferArr);
+    const channels = [];
+    let i;
+    let sample;
+    let offset = 0;
+    let pos = 0;
+
+    const setUint16 = (data: number) => {
+      view.setUint16(pos, data, true);
+      pos += 2;
+    };
+
+    const setUint32 = (data: number) => {
+      view.setUint32(pos, data, true);
+      pos += 4;
+    };
+
+    // write WAVE header
+    setUint32(0x46464952); // "RIFF"
+    setUint32(length - 8); // file length - 8
+    setUint32(0x45564157); // "WAVE"
+    setUint32(0x20746d66); // "fmt " chunk
+    setUint32(16); // chunk length
+    setUint16(1); // sample format (raw PCM)
+    setUint16(numOfChan);
+    setUint32(buffer.sampleRate);
+    setUint32(buffer.sampleRate * 2 * numOfChan); // byte rate
+    setUint16(numOfChan * 2); // block align
+    setUint16(16); // bits per sample
+    setUint32(0x61746164); // "data" chunk
+    setUint32(length - pos - 4); // chunk length
+
+    for (i = 0; i < buffer.numberOfChannels; i++) {
+      channels.push(buffer.getChannelData(i));
+    }
+
+    while (pos < length) {
+      for (i = 0; i < numOfChan; i++) {
+        sample = Math.max(-1, Math.min(1, channels[i][offset])); // clamp
+        sample = sample < 0 ? sample * 0x8000 : sample * 0x7fff; // scale to 16-bit
+        view.setInt16(pos, sample, true); // write sample
+        pos += 2;
+      }
+      offset++;
+    }
+
+    return new Blob([bufferArr], { type: 'audio/wav' });
+  };
+
   const handleStartExport = async () => {
     try {
-      recordedChunksRef.current = [];
+      isCanceledRef.current = false;
       setProgress(0);
-      setExportState('recording');
-      setStatusMessage('Recording project in real-time...');
+      setExportState('rendering');
 
-      // Find the main preview canvas
-      const previewCanvas = document.querySelector('.main-preview-canvas') as HTMLCanvasElement;
-      if (!previewCanvas) {
-        throw new Error('Preview canvas not found.');
+      // Ensure playback is paused
+      if (isPlaying) onTogglePlay();
+
+      const ffmpeg = await loadFFmpeg();
+
+      // Determine dimensions from selected Aspect Ratio preset
+      const preset = ASPECT_RATIO_PRESETS.find((p) => p.value === aspectRatio) || ASPECT_RATIO_PRESETS[0];
+      let renderW = preset.width;
+      let renderH = preset.height;
+
+      // Adjust resolution scale (SD vs HD vs Full HD)
+      if (exportResolution === '480p') {
+        const factor = 480 / renderH;
+        renderW = Math.round((renderW * factor) / 2) * 2; // ensure even dimensions
+        renderH = 480;
+      } else if (exportResolution === '1080p') {
+        const factor = 1080 / renderH;
+        renderW = Math.round((renderW * factor) / 2) * 2;
+        renderH = 1080;
       }
 
-      // Seek to 0 and ensure we are paused before starting
-      if (isPlaying) onTogglePlay();
-      onSeek(0);
+      // Create an offscreen render canvas
+      const canvas = document.createElement('canvas');
+      canvas.width = renderW;
+      canvas.height = renderH;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Could not create offscreen 2D context.');
 
-      // Give a brief moment to seek
-      await new Promise((resolve) => setTimeout(resolve, 500));
-
-      // Setup Canvas Capture Stream
-      const canvasStream = previewCanvas.captureStream(30); // 30 fps
-
-      // Setup AudioContext for mixing active tracks
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const audioCtx = new AudioContextClass();
-      const dest = audioCtx.createMediaStreamDestination();
-
-      const sourceNodes: any[] = [];
+      // --- STEP 1: Offline Audio Mixing (using OfflineAudioContext) ---
+      setStatusMessage('Decoding audio assets...');
+      const decodedBuffers = new Map<string, AudioBuffer>();
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       
-      // Connect all media elements to the AudioContext Destination
-      mediaElements.forEach((element) => {
-        try {
-          const source = audioCtx.createMediaElementSource(element);
-          source.connect(dest);
-          source.connect(audioCtx.destination); // Route to output speakers as well
-          sourceNodes.push(source);
-        } catch (e) {
-          // MediaElementAudioSourceNode can only be created once per element.
-          // If we run into an error, it is already connected, or we fallback.
+      const clipsWithAudio = tracks.flatMap((t) => t.clips).filter((c) => c.text === undefined);
+      
+      for (const clip of clipsWithAudio) {
+        if (isCanceledRef.current) return;
+        if (decodedBuffers.has(clip.assetId)) continue;
+        
+        const asset = assets.find((a) => a.id === clip.assetId);
+        if (asset && asset.url) {
+          try {
+            const response = await fetch(asset.url);
+            const arrayBuffer = await response.arrayBuffer();
+            const buffer = await audioCtx.decodeAudioData(arrayBuffer);
+            decodedBuffers.set(clip.assetId, buffer);
+          } catch (e) {
+            console.warn(`Could not decode audio for asset ${asset.name}:`, e);
+          }
         }
+      }
+
+      setStatusMessage('Mixing audio tracks...');
+      // Build offline audio graph
+      const offlineCtx = new OfflineAudioContext(2, Math.max(1, 44100 * duration), 44100);
+      let hasAudioTracks = false;
+
+      tracks.forEach((track) => {
+        track.clips.forEach((clip) => {
+          if (clip.text !== undefined) return;
+          const buffer = decodedBuffers.get(clip.assetId);
+          if (!buffer) return;
+
+          hasAudioTracks = true;
+          const source = offlineCtx.createBufferSource();
+          source.buffer = buffer;
+          source.playbackRate.value = clip.speed;
+
+          const gainNode = offlineCtx.createGain();
+          // Mix clip volume with master player volume
+          gainNode.gain.value = isMuted ? 0 : clip.volume * masterVolume;
+
+          source.connect(gainNode);
+          gainNode.connect(offlineCtx.destination);
+
+          const clipDuration = clip.timeEnd - clip.timeStart;
+          source.start(clip.timeStart, clip.trimStart, clipDuration);
+        });
       });
 
-      // Combine video and audio tracks
-      const combinedStream = new MediaStream();
-      canvasStream.getVideoTracks().forEach((track) => combinedStream.addTrack(track));
-      dest.stream.getAudioTracks().forEach((track) => combinedStream.addTrack(track));
-
-      // MediaRecorder configuration
-      let options = { mimeType: 'video/webm;codecs=vp9,opus' };
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: 'video/webm' };
+      if (hasAudioTracks) {
+        const mixedBuffer = await offlineCtx.startRendering();
+        const wavBlob = bufferToWav(mixedBuffer);
+        await ffmpeg.writeFile('audio.wav', new Uint8Array(await wavBlob.arrayBuffer()));
       }
 
-      const mediaRecorder = new MediaRecorder(combinedStream, options);
-      mediaRecorderRef.current = mediaRecorder;
+      // --- STEP 2: Frame-by-Frame Video Offline Rendering ---
+      const fps = 30;
+      const totalFrames = Math.max(1, Math.ceil(duration * fps));
+      setStatusMessage('Rendering video frames offline...');
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          recordedChunksRef.current.push(event.data);
-        }
-      };
+      for (let i = 0; i < totalFrames; i++) {
+        if (isCanceledRef.current) return;
 
-      mediaRecorder.onstop = async () => {
-        const rawWebmBlob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+        const time = i / fps;
         
-        if (exportFormat === 'webm') {
-          const url = URL.createObjectURL(rawWebmBlob);
-          setOutputUrl(url);
-          setExportState('done');
-          setStatusMessage('Export completed successfully!');
-        } else {
-          // Transcode via ffmpeg.wasm
-          await runTranscode(rawWebmBlob);
-        }
-      };
+        // Seek active video elements to precise source positions
+        const activeVideos: HTMLVideoElement[] = [];
+        tracks.forEach((track) => {
+          if (track.type !== 'video') return;
+          track.clips.forEach((clip) => {
+            if (clip.text !== undefined) return;
+            if (time >= clip.timeStart && time <= clip.timeEnd) {
+              const el = mediaElements.get(clip.id) as HTMLVideoElement;
+              if (el) activeVideos.push(el);
+            }
+          });
+        });
 
-      // Start playhead playback
-      onTogglePlay();
-      mediaRecorder.start();
-
-      // Track progress
-      const startTime = Date.now();
-      const interval = setInterval(() => {
-        const elapsed = (Date.now() - startTime) / 1000;
-        const percent = Math.min(100, Math.round((elapsed / duration) * 100));
-        setProgress(percent);
-
-        if (elapsed >= duration) {
-          clearInterval(interval);
-          if (mediaRecorder.state !== 'inactive') {
-            mediaRecorder.stop();
+        // Trigger currentTime seeks on elements directly
+        activeVideos.forEach((video) => {
+          const clip = tracks.flatMap(t => t.clips).find(c => c.id === video.id);
+          if (clip) {
+            const targetSourceTime = clip.trimStart + (time - clip.timeStart) * clip.speed;
+            video.currentTime = targetSourceTime;
           }
-          // Pause playback
-          onTogglePlay();
+        });
+
+        // Wait for all active elements to finish decoding and seeking
+        await Promise.all(activeVideos.map((video) => {
+          if (!video.seeking) return Promise.resolve();
+          return new Promise<void>((resolve) => {
+            const onSeeked = () => {
+              video.removeEventListener('seeked', onSeeked);
+              resolve();
+            };
+            video.addEventListener('seeked', onSeeked);
+            // Fallback timeout to prevent freezes on corrupted frames
+            setTimeout(() => {
+              video.removeEventListener('seeked', onSeeked);
+              resolve();
+            }, 100);
+          });
+        }));
+
+        // Draw visual layers onto offscreen canvas (Bottom to Top)
+        ctx.fillStyle = '#06070a';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        const videoTracks = tracks.filter((t) => t.type === 'video');
+
+        for (let tIndex = videoTracks.length - 1; tIndex >= 0; tIndex--) {
+          const track = videoTracks[tIndex];
+          const activeClip = track.clips.find(
+            (clip) => time >= clip.timeStart && time <= clip.timeEnd
+          );
+
+          if (activeClip) {
+            ctx.save();
+
+            const posX = activeClip.x ?? 0;
+            const posY = activeClip.y ?? 0;
+            const scale = activeClip.scale ?? 1.0;
+            const rotation = activeClip.rotation ?? 0;
+            const flipH = activeClip.flipH ?? false;
+            const flipV = activeClip.flipV ?? false;
+            const fitMode = activeClip.fitMode ?? 'fit';
+
+            const cx = canvas.width / 2 + posX;
+            const cy = canvas.height / 2 + posY;
+            ctx.translate(cx, cy);
+            ctx.rotate((rotation * Math.PI) / 180);
+            ctx.scale(flipH ? -scale : scale, flipV ? -scale : scale);
+
+            if (activeClip.text !== undefined) {
+              ctx.fillStyle = activeClip.textColor || '#ffffff';
+              const fSize = activeClip.fontSize || 48;
+              ctx.font = `bold ${fSize}px Outfit, Inter, sans-serif`;
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'middle';
+              ctx.fillText(activeClip.text, 0, 0);
+            } else {
+              const el = mediaElements.get(activeClip.id);
+              if (el) {
+                const video = el as HTMLVideoElement;
+                const sourceW = video.videoWidth || 640;
+                const sourceH = video.videoHeight || 360;
+
+                let w = sourceW;
+                let h = sourceH;
+
+                if (fitMode === 'fit') {
+                  const ratio = Math.min(canvas.width / sourceW, canvas.height / sourceH);
+                  w = sourceW * ratio;
+                  h = sourceH * ratio;
+                } else if (fitMode === 'fill') {
+                  const ratio = Math.max(canvas.width / sourceW, canvas.height / sourceH);
+                  w = sourceW * ratio;
+                  h = sourceH * ratio;
+                } else if (fitMode === 'stretch') {
+                  w = canvas.width;
+                  h = canvas.height;
+                }
+
+                ctx.drawImage(video, -w / 2, -h / 2, w, h);
+              }
+            }
+
+            ctx.restore();
+          }
         }
-      }, 250);
+
+        // Capture frame as JPEG and write to virtual filesystem
+        const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, 'image/jpeg', 0.85));
+        if (blob) {
+          const buffer = new Uint8Array(await blob.arrayBuffer());
+          await ffmpeg.writeFile(`frame_${i}.jpg`, buffer);
+        }
+
+        // Update progress percentage
+        setProgress(Math.round((i / totalFrames) * 90));
+      }
+
+      // --- STEP 3: Mux & Transcode via ffmpeg.wasm ---
+      setExportState('transcoding');
+      setProgress(92);
+      setStatusMessage('Assembling frames and mixing output...');
+
+      if (exportFormat === 'mp4') {
+        if (hasAudioTracks) {
+          await ffmpeg.exec([
+            '-framerate', '30',
+            '-i', 'frame_%d.jpg',
+            '-i', 'audio.wav',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            '-shortest',
+            'output.mp4'
+          ]);
+        } else {
+          await ffmpeg.exec([
+            '-framerate', '30',
+            '-i', 'frame_%d.jpg',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-pix_fmt', 'yuv420p',
+            'output.mp4'
+          ]);
+        }
+        const data = (await ffmpeg.readFile('output.mp4')) as any;
+        const mp4Blob = new Blob([data], { type: 'video/mp4' });
+        setOutputUrl(URL.createObjectURL(mp4Blob));
+
+      } else if (exportFormat === 'webm') {
+        if (hasAudioTracks) {
+          await ffmpeg.exec([
+            '-framerate', '30',
+            '-i', 'frame_%d.jpg',
+            '-i', 'audio.wav',
+            '-c:v', 'libvpx',
+            '-b:v', '1M',
+            '-c:a', 'libvorbis',
+            'output.webm'
+          ]);
+        } else {
+          await ffmpeg.exec([
+            '-framerate', '30',
+            '-i', 'frame_%d.jpg',
+            '-c:v', 'libvpx',
+            '-b:v', '1M',
+            'output.webm'
+          ]);
+        }
+        const data = (await ffmpeg.readFile('output.webm')) as any;
+        const webmBlob = new Blob([data], { type: 'video/webm' });
+        setOutputUrl(URL.createObjectURL(webmBlob));
+
+      } else if (exportFormat === 'gif') {
+        await ffmpeg.exec([
+          '-framerate', '10',
+          '-i', 'frame_%d.jpg',
+          '-vf', 'scale=320:-1:flags=lanczos',
+          '-c:v', 'gif',
+          'output.gif'
+        ]);
+        const data = (await ffmpeg.readFile('output.gif')) as any;
+        const gifBlob = new Blob([data], { type: 'image/gif' });
+        setOutputUrl(URL.createObjectURL(gifBlob));
+
+      } else if (exportFormat === 'mp3') {
+        if (hasAudioTracks) {
+          const data = (await ffmpeg.readFile('audio.wav')) as any;
+          const mp3Blob = new Blob([data], { type: 'audio/wav' }); // wav output directly
+          setOutputUrl(URL.createObjectURL(mp3Blob));
+        } else {
+          throw new Error('No audio tracks present to export as MP3.');
+        }
+      }
+
+      // Cleanup frame files from FFmpeg memory
+      for (let i = 0; i < totalFrames; i++) {
+        try {
+          await ffmpeg.deleteFile(`frame_${i}.jpg`);
+        } catch (_) {}
+      }
+      if (hasAudioTracks) {
+        try {
+          await ffmpeg.deleteFile('audio.wav');
+        } catch (_) {}
+      }
+
+      setProgress(100);
+      setExportState('done');
+      setStatusMessage('Export finished! Download below.');
 
     } catch (err: any) {
       console.error(err);
@@ -168,60 +456,12 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     }
   };
 
-  const runTranscode = async (rawBlob: Blob) => {
-    try {
-      setExportState('transcoding');
-      setProgress(50);
-      setStatusMessage(`Transcoding to ${exportFormat.toUpperCase()} format...`);
-
-      const ffmpeg = await loadFFmpeg();
-      
-      // Write the input WebM file
-      await ffmpeg.writeFile('input.webm', await fetchFile(rawBlob));
-
-      setProgress(75);
-      
-      if (exportFormat === 'mp4') {
-        setStatusMessage('Converting container to MP4...');
-        // Convert webm to mp4 using fast copy (since Chrome exports H.264/VP9)
-        // Or transcode for universal compatibility
-        await ffmpeg.exec(['-i', 'input.webm', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', 'output.mp4']);
-        const data = (await ffmpeg.readFile('output.mp4')) as any;
-        const mp4Blob = new Blob([data], { type: 'video/mp4' });
-        setOutputUrl(URL.createObjectURL(mp4Blob));
-      } else if (exportFormat === 'gif') {
-        setStatusMessage('Generating animated GIF...');
-        await ffmpeg.exec(['-i', 'input.webm', '-vf', 'fps=10,scale=320:-1:flags=lanczos', '-c:v', 'gif', 'output.gif']);
-        const data = (await ffmpeg.readFile('output.gif')) as any;
-        const gifBlob = new Blob([data], { type: 'image/gif' });
-        setOutputUrl(URL.createObjectURL(gifBlob));
-      } else if (exportFormat === 'mp3') {
-        setStatusMessage('Extracting MP3 Audio...');
-        await ffmpeg.exec(['-i', 'input.webm', '-vn', '-c:a', 'libmp3lame', '-q:a', '4', 'output.mp3']);
-        const data = (await ffmpeg.readFile('output.mp3')) as any;
-        const mp3Blob = new Blob([data], { type: 'audio/mp3' });
-        setOutputUrl(URL.createObjectURL(mp3Blob));
-      }
-
-      setProgress(100);
-      setExportState('done');
-      setStatusMessage('Transcoding finished!');
-    } catch (err: any) {
-      console.error(err);
-      setExportState('error');
-      setStatusMessage('Transcoding failed. Downloading raw WebM instead.');
-      // Fallback
-      const fallbackUrl = URL.createObjectURL(rawBlob);
-      setOutputUrl(fallbackUrl);
-      setExportState('done');
-    }
-  };
-
   const handleDownload = () => {
     if (!outputUrl) return;
     const a = document.createElement('a');
     a.href = outputUrl;
-    a.download = `my-editor-export.${exportFormat}`;
+    const ext = exportFormat === 'mp3' ? 'wav' : exportFormat; // output wav if audio
+    a.download = `my-editor-export.${ext}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -235,7 +475,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         <div className="modal-header">
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
             <Film size={20} className="logo-icon" />
-            <span>Export & Save Composition</span>
+            <span>Fast Offline Render & Export</span>
           </div>
           <button className="btn btn-icon" onClick={onClose} style={{ width: '28px', height: '28px', padding: 0 }}>
             <X size={16} />
@@ -245,7 +485,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         <div className="modal-body">
           {exportState === 'idle' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              <p>Configure output options. All edits will be consolidated and processed client-side.</p>
+              <p>Configure output options. All edits will be consolidated and rendered offline <b>frame-by-frame</b> at maximum CPU/GPU speed.</p>
               
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                 <label style={{ fontSize: '0.75rem', fontWeight: 600 }}>Format</label>
@@ -254,10 +494,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   value={exportFormat}
                   onChange={(e) => setExportFormat(e.target.value)}
                 >
-                  <option value="webm">WebM (Fastest, High Quality)</option>
                   <option value="mp4">MP4 (Universal Compatibility)</option>
-                  <option value="gif">GIF (Animated, Short loop)</option>
-                  <option value="mp3">MP3 (Audio Only)</option>
+                  <option value="webm">WebM (Fast & High Quality)</option>
+                  <option value="gif">GIF (Animated, Short Loop)</option>
+                  <option value="mp3">Audio Track Only (WAV format)</option>
                 </select>
               </div>
 
@@ -275,14 +515,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 </select>
               </div>
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 12px', background: 'rgba(245, 158, 11, 0.08)', borderRadius: '6px', border: '1px solid rgba(245, 158, 11, 0.2)', fontSize: '0.75rem', color: 'var(--color-warning)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 12px', background: 'rgba(99, 102, 241, 0.08)', borderRadius: '6px', border: '1px solid rgba(99, 102, 241, 0.2)', fontSize: '0.75rem', color: 'var(--color-primary)' }}>
                 <AlertTriangle size={16} style={{ flexShrink: 0 }} />
-                <span>MP4, GIF and MP3 export requires a quick WebAssembly transcode phase after recording.</span>
+                <span>Render executes silently in the background. Your speakers will remain quiet during export.</span>
               </div>
             </div>
           )}
 
-          {(exportState === 'recording' || exportState === 'transcoding') && (
+          {(exportState === 'rendering' || exportState === 'transcoding') && (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '24px 0', gap: '16px' }}>
               <RefreshCw className="logo-icon" style={{ animation: 'spin 2s linear infinite' }} size={32} />
               <div style={{ textAlign: 'center' }}>
